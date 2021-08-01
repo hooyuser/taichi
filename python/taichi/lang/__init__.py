@@ -18,6 +18,7 @@ from taichi.lang.type_factory_impl import type_factory
 from taichi.lang.util import (has_pytorch, is_taichi_class, python_scope,
                               taichi_scope, to_numpy_type, to_pytorch_type,
                               to_taichi_type)
+from taichi.snode.fields_builder import FieldsBuilder
 
 import taichi as ti
 
@@ -54,9 +55,13 @@ cuda = _ti_core.cuda
 metal = _ti_core.metal
 opengl = _ti_core.opengl
 cc = _ti_core.cc
-gpu = [cuda, metal, opengl]
+wasm = _ti_core.wasm
+vulkan = _ti_core.vulkan
+gpu = [cuda, metal, opengl, vulkan]
 cpu = _ti_core.host_arch()
 kernel_profiler_print = lambda: impl.get_runtime().prog.kernel_profiler_print()
+query_kernel_profiler = lambda name: impl.get_runtime(
+).prog.query_kernel_profiler(name)
 kernel_profiler_clear = lambda: impl.get_runtime().prog.kernel_profiler_clear()
 kernel_profiler_total_time = lambda: impl.get_runtime(
 ).prog.kernel_profiler_total_time()
@@ -73,7 +78,19 @@ def memory_profiler_print():
 
 
 extension = _ti_core.Extension
-is_extension_supported = _ti_core.is_extension_supported
+
+
+def is_extension_supported(arch, ext):
+    """Checks whether an extension is supported on an arch.
+
+    Args:
+        arch (taichi_core.Arch): Specified arch.
+        ext (taichi_core.Extension): Specified extension.
+
+    Returns:
+        bool: Whether `ext` is supported on `arch`.
+    """
+    return _ti_core.is_extension_supported(arch, ext)
 
 
 def reset():
@@ -127,6 +144,7 @@ class _SpecialConfig:
         self.log_level = 'info'
         self.gdb_trigger = False
         self.excepthook = False
+        self.experimental_real_function = False
 
 
 def init(arch=None,
@@ -187,6 +205,7 @@ def init(arch=None,
     env_spec.add('log_level', str)
     env_spec.add('gdb_trigger')
     env_spec.add('excepthook')
+    env_spec.add('experimental_real_function')
 
     # compiler configurations (ti.cfg):
     for key in dir(ti.cfg):
@@ -207,6 +226,8 @@ def init(arch=None,
     if not _test_mode:
         ti.set_gdb_trigger(spec_cfg.gdb_trigger)
         impl.get_runtime().print_preprocessed = spec_cfg.print_preprocessed
+        impl.get_runtime().experimental_real_function = \
+            spec_cfg.experimental_real_function
         ti.set_logging_level(spec_cfg.log_level.lower())
         if spec_cfg.excepthook:
             # TODO(#1405): add a way to restore old excepthook
@@ -225,6 +246,11 @@ def init(arch=None,
 
     # create a new program:
     impl.get_runtime().create_program()
+
+    ti.trace('Materializing runtime...')
+    impl.get_runtime().prog.materialize_runtime()
+
+    impl._root_fb = FieldsBuilder()
 
 
 def no_activate(*args):
@@ -277,6 +303,18 @@ transposed = deprecated('ti.transposed(a)', 'a.transpose()')(Matrix.transposed)
 
 
 def polar_decompose(A, dt=None):
+    """Perform polar decomposition (A=UP) for arbitrary size matrix.
+
+    Mathematical concept refers to https://en.wikipedia.org/wiki/Polar_decomposition.
+    This is only a wrapper for :func:`taichi.lang.linalg.polar_decompose`.
+
+    Args:
+        A (ti.Matrix(n, n)): input nxn matrix `A`.
+        dt (DataType): date type of elements in matrix `A`, typically accepts ti.f32 or ti.f64.
+
+    Returns:
+        Decomposed nxn matrices `U` and `P`.
+    """
     if dt is None:
         dt = impl.get_runtime().default_fp
     from .linalg import polar_decompose
@@ -284,10 +322,84 @@ def polar_decompose(A, dt=None):
 
 
 def svd(A, dt=None):
+    """Perform singular value decomposition (A=USV^T) for arbitrary size matrix.
+
+    Mathematical concept refers to https://en.wikipedia.org/wiki/Singular_value_decomposition.
+    This is only a wrappers for :func:`taichi.lang.linalg.svd`.
+
+    Args:
+        A (ti.Matrix(n, n)): input nxn matrix `A`.
+        dt (DataType): date type of elements in matrix `A`, typically accepts ti.f32 or ti.f64.
+
+    Returns:
+        Decomposed nxn matrices `U`, 'S' and `V`.
+    """
     if dt is None:
         dt = impl.get_runtime().default_fp
     from .linalg import svd
     return svd(A, dt)
+
+
+def eig(A, dt=None):
+    """Compute the eigenvalues and right eigenvectors of a real matrix.
+
+    Mathematical concept refers to https://en.wikipedia.org/wiki/Eigendecomposition_of_a_matrix.
+    2D implementation refers to :func:`taichi.lang.linalg.eig2x2`.
+
+    Args:
+        A (ti.Matrix(n, n)): 2D Matrix for which the eigenvalues and right eigenvectors will be computed.
+        dt (DataType): The datatype for the eigenvalues and right eigenvectors.
+
+    Returns:
+        eigenvalues (ti.Matrix(n, 2)): The eigenvalues in complex form. Each row stores one eigenvalue. The first number of the eigenvalue represents the real part and the second number represents the imaginary part.
+        eigenvectors (ti.Matrix(n*2, n)): The eigenvectors in complex form. Each column stores one eigenvector. Each eigenvector consists of n entries, each of which is represented by two numbers for its real part and imaginary part.
+    """
+    if dt is None:
+        dt = impl.get_runtime().default_fp
+    from taichi.lang import linalg
+    if A.n == 2:
+        return linalg.eig2x2(A, dt)
+    raise Exception("Eigen solver only supports 2D matrices.")
+
+
+def sym_eig(A, dt=None):
+    """Compute the eigenvalues and right eigenvectors of a real symmetric matrix.
+
+    Mathematical concept refers to https://en.wikipedia.org/wiki/Eigendecomposition_of_a_matrix.
+    2D implementation refers to :func:`taichi.lang.linalg.sym_eig2x2`.
+
+    Args:
+        A (ti.Matrix(n, n)): Symmetric Matrix for which the eigenvalues and right eigenvectors will be computed.
+        dt (DataType): The datatype for the eigenvalues and right eigenvectors.
+
+    Returns:
+        eigenvalues (ti.Vector(n)): The eigenvalues. Each entry store one eigen value.
+        eigenvectors (ti.Matrix(n, n)): The eigenvectors. Each column stores one eigenvector.
+    """
+    assert all(A == A.transpose()), "A needs to be symmetric"
+    if dt is None:
+        dt = impl.get_runtime().default_fp
+    from taichi.lang import linalg
+    if A.n == 2:
+        return linalg.sym_eig2x2(A, dt)
+    raise Exception("Symmetric eigen solver only supports 2D matrices.")
+
+
+def randn(dt=None):
+    """Generates a random number from standard normal distribution.
+
+    Implementation refers to :func:`taichi.lang.random.randn`.
+
+    Args:
+        dt (DataType): The datatype for the generated random number.
+
+    Returns:
+        The generated random number.
+    """
+    if dt is None:
+        dt = impl.get_runtime().default_fp
+    from .random import randn
+    return randn(dt)
 
 
 determinant = deprecated('ti.determinant(a)',
@@ -331,7 +443,8 @@ def clear_all_gradients():
             from taichi.lang.meta import clear_gradients
             clear_gradients(places)
 
-    visit(ti.root)
+    for root_fb in FieldsBuilder.finalized_roots():
+        visit(root_fb)
 
 
 def benchmark(func, repeat=300, args=()):
@@ -534,12 +647,22 @@ def stat_write(key, value):
 
 
 def is_arch_supported(arch):
+    """Checks whether an arch is supported on the machine.
+
+    Args:
+        arch (taichi_core.Arch): Specified arch.
+
+    Returns:
+        bool: Whether `arch` is supported on the machine.
+    """
     arch_table = {
         cuda: _ti_core.with_cuda,
         metal: _ti_core.with_metal,
         opengl: _ti_core.with_opengl,
         cc: _ti_core.with_cc,
-        cpu: lambda: True
+        vulkan: lambda: _ti_core.with_vulkan,
+        wasm: lambda: True,
+        cpu: lambda: True,
     }
     with_arch = arch_table.get(arch, lambda: False)
     try:
@@ -554,6 +677,11 @@ def is_arch_supported(arch):
 
 
 def supported_archs():
+    """Gets all supported archs on the machine.
+
+    Returns:
+        List[taichi_core.Arch]: All supported archs on the machine.
+    """
     archs = [cpu, cuda, metal, opengl, cc]
 
     wanted_archs = os.environ.get('TI_WANTED_ARCHS', '')
